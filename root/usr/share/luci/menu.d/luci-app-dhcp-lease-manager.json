@@ -1,0 +1,10 @@
+{
+	"admin/services/dhcp-lease-manager": {
+		"title": "DHCP 租约管理",
+		"order": 55,
+		"action": {
+			"type": "view",
+			"path": "dhcp-lease-manager"
+		}
+	}
+}

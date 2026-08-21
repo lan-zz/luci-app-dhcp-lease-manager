@@ -1,0 +1,15 @@
+{
+	"luci-app-dhcp-lease-manager": {
+		"description": "Grant access to DHCP Lease Manager",
+		"read": {
+			"file": {
+				"/usr/libexec/dhcp-lease-tools": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/dhcp-lease-tools": [ "exec" ]
+			}
+		}
+	}
+}

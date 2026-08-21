@@ -1,0 +1,8 @@
+# 强制 shell 脚本用 LF，避免 CRLF 导致 OpenWrt 上 shebang 解析失败
+*.sh         text eol=lf
+dhcp-lease-tools text eol=lf
+*.json       text eol=lf
+*.js         text eol=lf
+Makefile     text eol=lf
+LICENSE      text eol=lf
+README.md    text eol=lf

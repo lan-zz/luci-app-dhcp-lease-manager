@@ -1,0 +1,378 @@
+#!/bin/sh
+#
+# DHCP Lease Manager backend for LuCI.
+# Public interface:
+#   dhcp-lease-tools list
+#   dhcp-lease-tools delete <timestamp>
+#   dhcp-lease-tools release <ip>
+#   dhcp-lease-tools restart
+#   dhcp-lease-tools static-list
+#   dhcp-lease-tools leases-count
+
+set -u
+# 禁用通配符展开：租约文件的 client-id 字段是 '*'，若不加 noglob，
+# `set -- $line` 会把 '*' 展开成当前目录文件列表，破坏字段解析导致 JSON 非法。
+set -f
+
+# ─── Lease file auto-detection ────────────────────────────────────────────────
+detect_lease_file() {
+	for f in /tmp/dhcp.leases /tmp/udhcpd.leases /tmp/dnsmasq.leases; do
+		[ -f "$f" ] && { printf '%s' "$f"; return 0; }
+	done
+	return 1
+}
+
+LEASE_FILE="$(detect_lease_file)" || LEASE_FILE=""
+
+json_escape() {
+	printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/ /g; s/\r//g; s/\n/ /g'
+}
+
+json_string() {
+	printf '"%s"' "$(json_escape "${1:-}")"
+}
+
+json_bool() {
+	case "$1" in
+		true|1|yes) printf 'true' ;;
+		*)          printf 'false' ;;
+	esac
+}
+
+fail_json() {
+	printf '{"ok":false,"error":'
+	json_string "$1"
+	printf '}\n'
+	exit 1
+}
+
+now_epoch() { date '+%s'; }
+
+# ─── Format timestamp ─────────────────────────────────────────────────────────
+format_expiry() {
+	local exp="$1"
+	local now
+	now="$(now_epoch)"
+	if [ -z "$exp" ] || [ "$exp" -eq 0 ]; then
+		printf '%s' "permanent"
+	elif [ "$exp" -lt "$now" ]; then
+		printf '%s' "expired"
+	else
+		local delta=$((exp - now))
+		if [ "$delta" -ge 86400 ]; then
+			printf '%dd %dh' $((delta / 86400)) $((delta % 86400 / 3600))
+		elif [ "$delta" -ge 3600 ]; then
+			printf '%dh %dm' $((delta / 3600)) $((delta % 3600 / 60))
+		elif [ "$delta" -ge 60 ]; then
+			printf '%dm %ds' $((delta / 60)) $((delta % 60))
+		else
+			printf '%ds' "$delta"
+		fi
+	fi
+}
+
+format_datetime() {
+	local ts="$1"
+	if [ -z "$ts" ] || [ "$ts" -eq 0 ]; then
+		printf '%s' "-"
+		return
+	fi
+	# GNU date 用 @epoch；busybox 较新版本也支持，失败则回退输出原始时间戳。
+	date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null && return
+	printf '%s' "$ts"
+}
+
+is_static() {
+	local ip="$1"
+	# Check dhcp.leases for static entries (timestamp=0 means permanent)
+	# Static entries in dnsmasq: defined via /etc/config/dhcp, not in leases file
+	# We'll check /etc/config/dhcp for static leases
+	return 1
+}
+
+get_static_ips() {
+	# 静态地址分配是 /etc/config/dhcp 里的 'config host' 段（含 option ip）。
+	# uci show dhcp 输出形如：dhcp.@host[0].ip='192.168.1.100'
+	/sbin/uci -q show dhcp 2>/dev/null | \
+		awk -F= '/^dhcp\.@host\[[0-9]+\]\.ip=/{print $2}' | \
+		tr -d "'\""
+}
+
+# ─── List all leases ──────────────────────────────────────────────────────────
+list_leases() {
+	if [ -z "$LEASE_FILE" ] || [ ! -r "$LEASE_FILE" ]; then
+		printf '{"ok":true,"lease_file":"","leases":[]}\n'
+		return 0
+	fi
+
+	local now
+	now="$(now_epoch)"
+
+	printf '{"ok":true,"lease_file":'
+	json_string "$LEASE_FILE"
+	printf ',"leases":['
+
+	local first=1
+	while IFS= read -r line; do
+		# Skip empty/comment lines
+		[ -z "$line" ] && continue
+		case "$line" in \#*) continue ;; esac
+
+		# Parse: timestamp mac ip hostname client-id [lease-time]
+		# Example: 1724300418 00:11:22:33:44:55 192.168.1.100 hostname * 3600
+		set -- $line
+		[ $# -lt 4 ] && continue
+
+		local ts="$1"; local mac="$2"; local ip="$3"; local hostname="$4"
+		shift 4
+		local client_id="${1:-}"
+		local lease_time="${2:-0}"
+
+		# Normalize hostname
+		[ "$hostname" = "*" ] || [ -z "$hostname" ] && hostname="-"
+
+		# Determine expiry
+		local expiry_text expiry_epoch is_permanent is_expired
+		if [ "$ts" -eq 0 ]; then
+			expiry_text="永久"
+			expiry_epoch="0"
+			is_permanent="true"
+			is_expired="false"
+		else
+			expiry_epoch="$ts"
+			expiry_text="$(format_expiry "$ts")"
+			is_permanent="false"
+			if [ "$ts" -lt "$now" ]; then
+				is_expired="true"
+			else
+				is_expired="false"
+			fi
+		fi
+
+		# Check if this IP has a static reservation
+		local static="false"
+		for static_ip in $(get_static_ips 2>/dev/null); do
+			[ "$static_ip" = "$ip" ] && { static="true"; break; }
+		done
+
+		# Format MAC for display
+		local mac_display
+		mac_display="$(printf '%s' "$mac" | awk '{print toupper($0)}')"
+
+		# Format datetime
+		local datetime
+		if [ "$ts" -eq 0 ]; then
+			datetime="永久"
+		else
+			datetime="$(format_datetime "$ts")"
+		fi
+
+		[ "$first" -eq 0 ] && printf ','
+		first=0
+
+		printf '{\n'
+		printf '"timestamp":%s,\n'   "$ts"
+		printf '"timestamp_str":%s,\n' "$(json_string "$datetime")"
+		printf '"mac":%s,\n'         "$(json_string "$mac")"
+		printf '"mac_upper":%s,\n'    "$(json_string "$mac_display")"
+		printf '"ip":%s,\n'           "$(json_string "$ip")"
+		printf '"hostname":%s,\n'     "$(json_string "$hostname")"
+		printf '"client_id":%s,\n'    "$(json_string "$client_id")"
+		printf '"expiry_text":%s,\n'  "$(json_string "$expiry_text")"
+		printf '"expiry_epoch":%s,\n' "$expiry_epoch"
+		printf '"lease_time":%s,\n'   "$(json_string "$lease_time")"
+		printf '"is_permanent":%s,\n' "$is_permanent"
+		printf '"is_expired":%s,\n'   "$is_expired"
+		printf '"is_static":%s\n'     "$static"
+		printf '}'
+	done < "$LEASE_FILE"
+
+	printf ']}\n'
+}
+
+# ─── Delete a lease by timestamp ─────────────────────────────────────────────
+delete_lease() {
+	local ts="${1:-}"
+	[ -z "$ts" ] && fail_json "缺少租约时间戳参数"
+
+	[ -z "$LEASE_FILE" ] && fail_json "找不到租约文件"
+	[ ! -f "$LEASE_FILE" ] && fail_json "租约文件不存在：$LEASE_FILE"
+	[ ! -w "$LEASE_FILE" ] && fail_json "租约文件不可写"
+
+	if ! grep -q "^${ts} " "$LEASE_FILE" 2>/dev/null; then
+		fail_json "租约文件中找不到时间戳为 $ts 的记录"
+	fi
+
+	# Create temp file without the target line
+	local tmp="$LEASE_FILE.$$.tmp"
+	if grep -v "^${ts} " "$LEASE_FILE" > "$tmp" 2>/dev/null; then
+		mv "$tmp" "$LEASE_FILE"
+		printf '{"ok":true,"deleted":%s}\n' "$(json_string "$ts")"
+	else
+		rm -f "$tmp"
+		fail_json "删除租约失败"
+	fi
+}
+
+# ─── Delete a lease by IP ────────────────────────────────────────────────────
+delete_lease_by_ip() {
+	local ip="${1:-}"
+	[ -z "$ip" ] && fail_json "缺少 IP 地址参数"
+
+	[ -z "$LEASE_FILE" ] && fail_json "找不到租约文件"
+	[ ! -f "$LEASE_FILE" ] && fail_json "租约文件不存在"
+
+	if ! grep -q " ${ip} " "$LEASE_FILE" 2>/dev/null; then
+		fail_json "租约文件中找不到 IP：$ip"
+	fi
+
+	local tmp="$LEASE_FILE.$$.tmp"
+	if grep -v " ${ip} " "$LEASE_FILE" > "$tmp" 2>/dev/null; then
+		mv "$tmp" "$LEASE_FILE"
+		printf '{"ok":true,"deleted_ip":%s}\n' "$(json_string "$ip")"
+	else
+		rm -f "$tmp"
+		fail_json "删除租约失败"
+	fi
+}
+
+# ─── Restart dnsmasq ─────────────────────────────────────────────────────────
+restart_dnsmasq() {
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		printf '{"ok":true,"service":"dnsmasq","action":"restarted"}\n'
+	else
+		# Try alternate service names
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1 && \
+			printf '{"ok":true,"service":"dnsmasq","action":"restarted"}\n' || \
+			fail_json "重启 dnsmasq 失败"
+	fi
+}
+
+# ─── List static DHCP reservations ────────────────────────────────────────────
+list_static() {
+	printf '{"ok":true,"static_leases":['
+
+	local first=1
+	# Parse dhcp config for static hosts
+	# Format in /etc/config/dhcp:
+	# config host 'name'
+	#   option mac 'xx:xx:xx:xx:xx:xx'
+	#   option ip '192.168.1.xx'
+	#   option name 'hostname'
+
+	local section
+	for section in $(/sbin/uci -q show dhcp 2>/dev/null | awk -F= '/^dhcp\.@host\[[0-9]+\]=host$/{sub(/^dhcp\.@host\[/,""); sub(/\]=host$/,""); print}'); do
+		local mac ip name
+		mac="$(/sbin/uci -q get "dhcp.@host[$section].mac" 2>/dev/null)"
+		ip="$(/sbin/uci -q get "dhcp.@host[$section].ip" 2>/dev/null)"
+		name="$(/sbin/uci -q get "dhcp.@host[$section].name" 2>/dev/null)"
+
+		[ -z "$ip" ] && continue
+
+		[ "$first" -eq 0 ] && printf ','
+		first=0
+
+		printf '{"section":%s,"mac":%s,"ip":%s,"name":%s}' \
+			"$(json_string "host_$section")" \
+			"$(json_string "$mac")" \
+			"$(json_string "$ip")" \
+			"$(json_string "${name:-.}")"
+	done
+
+	printf ']}\n'
+}
+
+# ─── Release a DHCP lease on the client side ─────────────────────────────────
+# This sends a DHCPRELEASE to the server (works if client is also OpenWrt/udhcpc)
+force_renew_client() {
+	local ip="${1:-}"
+	[ -z "$ip" ] && fail_json "缺少 IP 地址参数"
+
+	# Method 1: Try using nmap/nc to send DHCP INFORM (no direct client control)
+	# DHCP protocol: the client must send DHCPRELEASE itself.
+	# We can only do: clear server-side lease + restart dnsmasq
+
+	# Method 2: If we can reach the client via SSH, send release
+	# (would need credentials, not available here)
+
+	# Best effort: just delete lease on server side and restart
+	delete_lease_by_ip "$ip"
+	restart_dnsmasq
+}
+
+# ─── Compact / clean expired leases ───────────────────────────────────────────
+clean_expired() {
+	[ -z "$LEASE_FILE" ] || [ ! -f "$LEASE_FILE" ] && {
+		printf '{"ok":true,"cleaned":0}\n'
+		return 0
+	}
+
+	local now
+	now="$(now_epoch)"
+	local tmp="$LEASE_FILE.$$.clean"
+	local count=0
+
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		case "$line" in \#*) continue ;; esac
+		set -- $line
+		local ts="$1"
+		# Keep: timestamp=0 (permanent), or ts > now (still valid)
+		if [ "$ts" -eq 0 ] || [ "$ts" -ge "$now" ]; then
+			printf '%s\n' "$line"
+		else
+			count=$((count + 1))
+		fi
+	done < "$LEASE_FILE" > "$tmp"
+
+	mv "$tmp" "$LEASE_FILE"
+	printf '{"ok":true,"cleaned":%d}\n' "$count"
+}
+
+# ─── Quick stats ──────────────────────────────────────────────────────────────
+leases_count() {
+	if [ -z "$LEASE_FILE" ] || [ ! -f "$LEASE_FILE" ]; then
+		printf '{"ok":true,"total":0,"active":0,"expired":0,"file":""}\n'
+		return 0
+	fi
+
+	local now total active expired permanent
+	now="$(now_epoch)"
+	total=0; active=0; expired=0; permanent=0
+
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		case "$line" in \#*) continue ;; esac
+		set -- $line
+		[ $# -lt 3 ] && continue
+
+		total=$((total + 1))
+		local ts="$1"
+		if [ "$ts" -eq 0 ]; then
+			permanent=$((permanent + 1))
+			active=$((active + 1))
+		elif [ "$ts" -ge "$now" ]; then
+			active=$((active + 1))
+		else
+			expired=$((expired + 1))
+		fi
+	done < "$LEASE_FILE"
+
+	printf '{"ok":true,"total":%d,"active":%d,"expired":%d,"permanent":%d,"file":%s}\n' \
+		"$total" "$active" "$expired" "$permanent" "$(json_string "$LEASE_FILE")"
+}
+
+# ─── Main dispatch ───────────────────────────────────────────────────────────
+case "${1:-}" in
+	list)           list_leases ;;
+	delete)         delete_lease "${2:-}" ;;
+	delete-ip)      delete_lease_by_ip "${2:-}" ;;
+	restart)        restart_dnsmasq ;;
+	static-list)    list_static ;;
+	release)        force_renew_client "${2:-}" ;;
+	clean-expired)  clean_expired ;;
+	count)          leases_count ;;
+	detect)         [ -n "$LEASE_FILE" ] && echo "$LEASE_FILE" || exit 1 ;;
+	*)              fail_json "用法：dhcp-lease-tools list|delete <ts>|restart|static-list|clean-expired" ;;
+esac

@@ -1,0 +1,25 @@
+# Build artifacts
+*.ipk
+*.apk
+dist/
+build_64/
+
+# Python __pycache__
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*~
+
+# Reference packages downloaded during development
+pushbot-ref.apk
+luci-app-pushbot_*.ipk
+apk-tools-static-*.apk
+sbin/
