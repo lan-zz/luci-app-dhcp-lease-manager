@@ -82,14 +82,6 @@ format_datetime() {
 	printf '%s' "$ts"
 }
 
-is_static() {
-	local ip="$1"
-	# Check dhcp.leases for static entries (timestamp=0 means permanent)
-	# Static entries in dnsmasq: defined via /etc/config/dhcp, not in leases file
-	# We'll check /etc/config/dhcp for static leases
-	return 1
-}
-
 get_static_ips() {
 	# 静态地址分配是 /etc/config/dhcp 里的 'config host' 段（含 option ip）。
 	# uci show dhcp 输出形如：dhcp.@host[0].ip='192.168.1.100'
@@ -111,6 +103,10 @@ list_leases() {
 	printf '{"ok":true,"lease_file":'
 	json_string "$LEASE_FILE"
 	printf ',"leases":['
+
+	# Cache static IPs once (avoid repeated uci calls per lease)
+	local CACHED_STATIC_IPS
+	CACHED_STATIC_IPS=" $(get_static_ips 2>/dev/null) "
 
 	local first=1
 	while IFS= read -r line; do
@@ -149,11 +145,11 @@ list_leases() {
 			fi
 		fi
 
-		# Check if this IP has a static reservation
+		# Check if this IP has a static reservation (cached lookup)
 		local static="false"
-		for static_ip in $(get_static_ips 2>/dev/null); do
-			[ "$static_ip" = "$ip" ] && { static="true"; break; }
-		done
+		case "$CACHED_STATIC_IPS" in
+			*" $ip "*) static="true" ;;
+		esac
 
 		# Format MAC for display
 		local mac_display
@@ -222,12 +218,14 @@ delete_lease_by_ip() {
 	[ -z "$LEASE_FILE" ] && fail_json "找不到租约文件"
 	[ ! -f "$LEASE_FILE" ] && fail_json "租约文件不存在"
 
-	if ! grep -q " ${ip} " "$LEASE_FILE" 2>/dev/null; then
+	# Use awk for exact field-3 match (avoid substring false positives
+	# like 192.168.1.1 matching 192.168.1.10 or 192.168.1.100)
+	if ! awk -v ip="$ip" '$3 == ip {found=1; exit} END{exit !found}' "$LEASE_FILE" 2>/dev/null; then
 		fail_json "租约文件中找不到 IP：$ip"
 	fi
 
 	local tmp="$LEASE_FILE.$$.tmp"
-	if grep -v " ${ip} " "$LEASE_FILE" > "$tmp" 2>/dev/null; then
+	if awk -v ip="$ip" '$3 != ip' "$LEASE_FILE" > "$tmp" 2>/dev/null; then
 		mv "$tmp" "$LEASE_FILE"
 		printf '{"ok":true,"deleted_ip":%s}\n' "$(json_string "$ip")"
 	else
@@ -238,14 +236,10 @@ delete_lease_by_ip() {
 
 # ─── Restart dnsmasq ─────────────────────────────────────────────────────────
 restart_dnsmasq() {
-	/etc/init.d/dnsmasq restart >/dev/null 2>&1
-	if [ $? -eq 0 ]; then
+	if /etc/init.d/dnsmasq restart >/dev/null 2>&1; then
 		printf '{"ok":true,"service":"dnsmasq","action":"restarted"}\n'
 	else
-		# Try alternate service names
-		/etc/init.d/dnsmasq restart >/dev/null 2>&1 && \
-			printf '{"ok":true,"service":"dnsmasq","action":"restarted"}\n' || \
-			fail_json "重启 dnsmasq 失败"
+		fail_json "重启 dnsmasq 失败"
 	fi
 }
 
@@ -288,13 +282,6 @@ list_static() {
 force_renew_client() {
 	local ip="${1:-}"
 	[ -z "$ip" ] && fail_json "缺少 IP 地址参数"
-
-	# Method 1: Try using nmap/nc to send DHCP INFORM (no direct client control)
-	# DHCP protocol: the client must send DHCPRELEASE itself.
-	# We can only do: clear server-side lease + restart dnsmasq
-
-	# Method 2: If we can reach the client via SSH, send release
-	# (would need credentials, not available here)
 
 	# Best effort: just delete lease on server side and restart
 	delete_lease_by_ip "$ip"

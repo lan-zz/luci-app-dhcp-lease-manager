@@ -13,6 +13,9 @@ var state = {
 	confirmDelete: {}
 };
 
+var _darkMode = null;
+var _searchTimer = null;
+
 function parseJson(stdout) {
 	try {
 		return JSON.parse(stdout || '{}');
@@ -302,7 +305,9 @@ function pageUsesDarkBackground(viewRoot) {
 }
 
 function themeClass(viewRoot) {
-	return pageUsesDarkBackground(viewRoot) ? ' lm-dark' : '';
+	if (_darkMode === null)
+		_darkMode = pageUsesDarkBackground(viewRoot);
+	return _darkMode ? ' lm-dark' : '';
 }
 
 function statCard(label, value, tone) {
@@ -336,9 +341,10 @@ function renderToolbar() {
 		'type': 'text',
 		'value': state.search,
 		'placeholder': _('搜索 MAC / IP / 主机名...'),
-		'input': function() {
+				'input': function() {
 			state.search = this.value;
-			updateTable();
+			clearTimeout(_searchTimer);
+			_searchTimer = setTimeout(updateTable, 200);
 		}
 	});
 
@@ -382,40 +388,51 @@ function renderToolbar() {
 }
 
 function updateTable() {
-	var tableRoot = document.getElementById('lm-table-root');
-	if (!tableRoot)
+	var tbody = document.querySelector('.lm-table tbody');
+	if (!tbody)
 		return;
-	tableRoot.innerHTML = '';
-	tableRoot.appendChild(renderTable());
+	var rows = filteredLeases();
+	tbody.innerHTML = '';
+	if (rows.length) {
+		rows.forEach(function(l) {
+			tbody.appendChild(renderRow(l));
+		});
+	} else {
+		tbody.appendChild(E('tr', {}, [
+			E('td', { 'colspan': 8, 'class': 'lm-empty' }, _('没有匹配的租约记录'))
+		]));
+	}
+}
+
+function renderRow(l) {
+	var isStatic = state.staticIps.indexOf(l.ip) !== -1;
+
+	return E('tr', { 'class': l.is_expired ? 'lm-row-expired' : '' }, [
+		E('td', { 'class': 'mono' }, l.mac_upper || l.mac || '-'),
+		E('td', { 'class': 'mono' }, l.ip || '-'),
+		E('td', {}, l.hostname || '-'),
+		E('td', {}, [
+			l.is_permanent ? E('span', { 'class': 'lm-badge lm-badge-perm' }, _('永久')) :
+			l.is_expired ? E('span', { 'class': 'lm-badge lm-badge-exp' }, _('已过期')) :
+			E('span', { 'class': 'lm-badge lm-badge-ok' }, _('有效')),
+			isStatic ? ' ' + E('span', { 'class': 'lm-badge lm-badge-static' }, _('静态保留')) : ''
+		]),
+		E('td', {}, l.expiry_text || '-'),
+		E('td', {}, l.timestamp_str || '-'),
+		E('td', {}, (l.client_id && l.client_id !== '*' && l.client_id !== '-') ? E('code', {}, l.client_id) : '-'),
+		E('td', { 'class': 'lm-actions' }, [
+			E('button', {
+				'class': 'btn cbi-button-negative lm-btn-sm',
+				'click': function() { deleteLease(l); },
+				'disabled': state.busy ? 'disabled' : null
+			}, _('删除'))
+		])
+	]);
 }
 
 function renderTable() {
 	var rows = filteredLeases();
-	var tbody = rows.length ? rows.map(function(l) {
-		var isStatic = state.staticIps.indexOf(l.ip) !== -1;
-
-		return E('tr', { 'class': l.is_expired ? 'lm-row-expired' : '' }, [
-			E('td', { 'class': 'mono' }, l.mac_upper || l.mac || '-'),
-			E('td', { 'class': 'mono' }, l.ip || '-'),
-			E('td', {}, l.hostname || '-'),
-			E('td', {}, [
-				l.is_permanent ? E('span', { 'class': 'lm-badge lm-badge-perm' }, _('永久')) :
-				l.is_expired ? E('span', { 'class': 'lm-badge lm-badge-exp' }, _('已过期')) :
-				E('span', { 'class': 'lm-badge lm-badge-ok' }, _('有效')),
-				isStatic ? ' ' + E('span', { 'class': 'lm-badge lm-badge-static' }, _('静态保留')) : ''
-			]),
-			E('td', {}, l.expiry_text || '-'),
-			E('td', {}, l.timestamp_str || '-'),
-			E('td', {}, (l.client_id && l.client_id !== '*' && l.client_id !== '-') ? E('code', {}, l.client_id) : '-'),
-			E('td', { 'class': 'lm-actions' }, [
-				E('button', {
-					'class': 'btn cbi-button-negative lm-btn-sm',
-					'click': function() { deleteLease(l); },
-					'disabled': state.busy ? 'disabled' : null
-				}, _('删除'))
-			])
-		]);
-	}) : [
+	var tbody = rows.length ? rows.map(renderRow) : [
 		E('tr', {}, [
 			E('td', { 'colspan': 8, 'class': 'lm-empty' }, _('没有匹配的租约记录'))
 		])
@@ -511,7 +528,8 @@ function update() {
 }
 
 return view.extend({
-	load: function() {
+		load: function() {
+		_darkMode = null;
 		return refresh();
 	},
 
